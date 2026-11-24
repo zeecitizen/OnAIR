@@ -334,6 +334,32 @@ def test_sbn_adapter_DataSource_get_next_returns_expected_data_when_new_data_is_
     assert result == expected_result
 
 
+def test_sbn_adapter_DataSource_get_next_turns_all_data_points_of_new_write_buffer_to_unknown():
+    # Arrange
+    cut = DataSource.__new__(DataSource)
+    cut.new_data = True
+    cut.new_data_lock = MagicMock()
+    cut.double_buffer_read_index = pytest.gen.randint(0, 1)
+    pre_call_index = cut.double_buffer_read_index
+    num_data_points = pytest.gen.randint(1, 10)  # arbitrary, 1 to 10
+    fake_last_frame = [MagicMock() for _ in range(num_data_points)]
+    fake_next_frame = [MagicMock() for _ in range(num_data_points)]
+    expected_last_frame = fake_last_frame.copy()
+    expected_result = fake_next_frame.copy()
+    cut.currentData = [None, None]
+    cut.currentData[pre_call_index] = {"data": fake_last_frame}
+    cut.currentData[(pre_call_index + 1) % 2] = {"data": fake_next_frame}
+
+    # Act
+    result = cut.get_next()
+
+    # Assert
+    assert result == expected_result
+    assert cut.currentData[pre_call_index]["data"] == ["-"] * num_data_points
+    # the frame handed out by the previous call is left as it was
+    assert fake_last_frame == expected_last_frame
+
+
 def test_sbn_adapter_DataSource_get_next_when_called_multiple_times_when_new_data_is_true():
     # copied from test_redis_adapter.py
     # test_redis_adapter_DataSource_get_next_when_called_multiple_times_when_new_data_is_true
@@ -561,6 +587,80 @@ def test_sbn_adapter_DataSource_get_current_data_unpacks_sub_fields_correctly(mo
     # Assert
     assert cut.currentData[(cut.double_buffer_read_index + 1) % 2] == expected_data
     assert cut.new_data == True
+
+
+def test_sbn_adapter_DataSource_get_current_data_writes_message_and_sets_new_data_in_one_hold_of_new_data_lock(
+    mocker,
+):
+    # Arrange
+    cut = DataSource.__new__(DataSource)
+    cut.double_buffer_read_index = pytest.gen.randint(0, 1)
+    cut.new_data = False
+    lock_events = []
+
+    class FakeData(list):
+        def __setitem__(self, index, value):
+            lock_events.append("write")
+            super().__setitem__(index, value)
+
+    cut.currentData = [
+        {"headers": ["fake_app.field1"], "data": FakeData([[0]])},
+        {"headers": ["fake_app.field1"], "data": FakeData([[0]])},
+    ]
+    cut.new_data_lock = MagicMock()
+    cut.new_data_lock.__enter__.side_effect = lambda: lock_events.append("acquire")
+    cut.new_data_lock.__exit__.side_effect = lambda *_: lock_events.append(
+        ("release", cut.new_data)
+    )
+
+    arg_recv_msg = MagicMock()
+    arg_recv_msg._fields_ = [("TlmHeader", MagicMock()), ("field1", MagicMock())]
+    arg_data_struct = MagicMock()
+    arg_app_name = "fake_app"
+    mocker.patch.object(cut, "gather_field_names", return_value=["field1"])
+
+    # Act
+    cut.get_current_data(arg_recv_msg, arg_data_struct, arg_app_name)
+
+    # Assert
+    assert lock_events == ["acquire", "write", ("release", True)]
+
+
+def test_sbn_adapter_DataSource_frame_only_holds_data_received_since_the_previous_frame():
+    # Arrange
+    cut = DataSource.__new__(DataSource)
+    cut.double_buffer_read_index = pytest.gen.randint(0, 1)
+    cut.new_data_lock = MagicMock()
+    cut.new_data = False
+    fake_headers = ["fake_fast.value", "fake_slow.value", "fake_never.value"]
+    cut.currentData = [
+        {"headers": fake_headers, "data": [[0], [0], [0]]},
+        {"headers": fake_headers, "data": [[0], [0], [0]]},
+    ]
+
+    def fake_message(value):
+        message = MagicMock()
+        message._fields_ = [("TlmHeader", MagicMock()), ("value", MagicMock())]
+        message.value = value
+        return message
+
+    # Act
+    # fake_fast is received before every frame, fake_slow before every other
+    # frame and fake_never is not received at all
+    frames = []
+    for step in range(1, 5):
+        cut.get_current_data(fake_message(step), MagicMock(), "fake_fast")
+        if step % 2 == 1:
+            cut.get_current_data(fake_message(step * 10), MagicMock(), "fake_slow")
+        frames.append(cut.get_next())
+
+    # Assert
+    assert frames == [
+        ["1", "10", [0]],
+        ["2", "-", "-"],
+        ["3", "30", "-"],
+        ["4", "-", "-"],
+    ]
 
 
 # has_data tests

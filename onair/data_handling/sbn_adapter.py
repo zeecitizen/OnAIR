@@ -27,7 +27,7 @@ import message_headers as msg_hdr
 
 from onair.data_handling.parser_util import *
 
-# Note: The double buffer does not clear between switching. If fresh data doesn't come in, stale data is returned (delayed by 1 frame)
+# Note: The double buffer is blanked ("-") when switching, so a frame only holds the data received since the previous frame
 
 
 class DataSource(OnAirDataSource):
@@ -125,6 +125,7 @@ class DataSource(OnAirDataSource):
 
     def get_next(self):
         """Provides the latest data from SBN in a dictionary of lists structure.
+        Data not received since the previous call is "-" ([0] in the first frame).
         Returned data is safe to use until the next get_next call.
         Blocks until new data is available."""
 
@@ -142,6 +143,9 @@ class DataSource(OnAirDataSource):
             self.new_data = False
             self.double_buffer_read_index = (self.double_buffer_read_index + 1) % 2
             read_index = self.double_buffer_read_index
+            # turn all data points of the new write buffer to unknown
+            write_buffer = self.currentData[(read_index + 1) % 2]
+            write_buffer["data"] = ["-" for _ in write_buffer["data"]]
 
         return self.currentData[read_index]["data"]
 
@@ -175,28 +179,27 @@ class DataSource(OnAirDataSource):
                 )
             )
 
-            # TODO: Lock needed here?
             self.get_current_data(recv_msg, data_struct, app_name)
 
     def get_current_data(self, recv_msg, data_struct, app_name):
-        # TODO: Lock needed here?
-        current_buffer = self.currentData[(self.double_buffer_read_index + 1) % 2]
-
-        # Skip the header, walk through the stuct
-        for field_name, field_type in recv_msg._fields_[1:]:
-            field_names = self.gather_field_names(field_name, field_type)
-
-            for name in field_names:
-                idx = current_buffer["headers"].index(app_name + "." + name)
-                # Pull the data out of the message buy walking down the nested types
-                data = ""
-                current_object = recv_msg
-                for sub_type in name.split("."):
-                    current_object = getattr(current_object, sub_type)
-                    data = str(current_object)  # note does not work for arrays?
-                current_buffer["data"][idx] = data
-
+        # Hold the lock so get_next cannot switch buffers part way through a message
         with self.new_data_lock:
+            current_buffer = self.currentData[(self.double_buffer_read_index + 1) % 2]
+
+            # Skip the header, walk through the stuct
+            for field_name, field_type in recv_msg._fields_[1:]:
+                field_names = self.gather_field_names(field_name, field_type)
+
+                for name in field_names:
+                    idx = current_buffer["headers"].index(app_name + "." + name)
+                    # Pull the data out of the message buy walking down the nested types
+                    data = ""
+                    current_object = recv_msg
+                    for sub_type in name.split("."):
+                        current_object = getattr(current_object, sub_type)
+                        data = str(current_object)  # note does not work for arrays?
+                    current_buffer["data"][idx] = data
+
             self.new_data = True
 
     def has_data(self):
