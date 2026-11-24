@@ -1,0 +1,39 @@
+name: Redis example against real servers
+
+# Verification branch on a fork: not for upstream.
+on:
+  push:
+
+jobs:
+  redis-example:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+    - name: Start two Redis servers (ports 6379 and 6380) and install OnAIR requirements
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq redis-server
+        sudo systemctl stop redis-server || true
+        redis-server --port 6379 --daemonize yes
+        redis-server --port 6380 --daemonize yes
+        sleep 1
+        redis-cli -p 6379 ping
+        redis-cli -p 6380 ping
+        redis-server --version
+        python -m pip install -q --upgrade pip
+        pip install -q -r requirements-run.txt
+    - name: Run the documented Redis example, then publish two channels back to back
+      run: |
+        python -u driver.py onair/config/redis_example.ini > onair_out.txt 2>&1 &
+        sleep 6
+        python -u verification/publish_pairs.py
+        sleep 3
+        kill %1 || true
+        echo "================ OnAIR output ================"
+        grep -E "STEP|CURRENT DATA|connected|Subscribing" onair_out.txt | head -150
+    - name: Verdict
+      run: python verification/check_output.py onair_out.txt
